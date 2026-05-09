@@ -5,7 +5,7 @@ exports.generateTutor = async (req, res) => {
   const connection = await db.getConnection();
 
   try {
-    const { topic,instructions,parent_topic_id } = req.body;
+    const { topic, instructions, id } = req.body;
 
     const response = await axios.post(
       `${process.env.PYTHON_SERVICE_URL}/generate`,
@@ -13,27 +13,37 @@ exports.generateTutor = async (req, res) => {
       {
         headers: {
           "Content-Type": "application/json",
-          "x-api-key": process.env.INTERNAL_API_KEY
-        }
-      }
+          "x-api-key": process.env.INTERNAL_API_KEY,
+        },
+      },
     );
-
     const data = response.data;
 
     await connection.beginTransaction();
 
     // 2. Insert main topic
-    const [topicResult] = await connection.execute(
-      "INSERT INTO topics (user_id,title, overview, parent_id) VALUES (?, ?, ?)",
-      [req.user.id, data.topic, data.overview, parent_topic_id || null]
-    );
+    let mainTopicId;
 
-    const mainTopicId = topicResult.insertId;
+    if (id) {
+      await connection.execute(
+        "UPDATE topics SET title = ?, overview = ? WHERE id = ?",
+        [data.topic, data.overview || null, id],
+      );
+
+      mainTopicId = id; // use existing id
+    } else {
+      const [topicResult] = await connection.execute(
+        "INSERT INTO topics (created_by, title, overview) VALUES (?, ?, ?)",
+        [req.user.id, data.topic, data.overview || null],
+      );
+
+      mainTopicId = topicResult.insertId; // only available on insert
+    }
 
     for (const sub of data.subtopics) {
       await connection.execute(
-        "INSERT INTO topics (title, parent_id) VALUES (?, ?)",
-        [sub, mainTopicId]
+        "INSERT INTO topics (created_by,title, parent_id) VALUES (?, ?, ?)",
+        [req.user.id, sub, mainTopicId],
       );
     }
 
@@ -46,9 +56,9 @@ exports.generateTutor = async (req, res) => {
           mainTopicId,
           mcq.question,
           JSON.stringify(mcq.options),
-          mcq.correct_answer,
-          mcq.explanation
-        ]
+          mcq.correct_answer_index,
+          mcq.explanation,
+        ],
       );
     }
 
@@ -57,23 +67,20 @@ exports.generateTutor = async (req, res) => {
     return res.json({
       success: true,
       topic_id: mainTopicId,
-      data
+      data,
     });
-
   } catch (error) {
     await connection.rollback();
     console.error(error);
 
     return res.status(500).json({
       success: false,
-      message: "DB transaction failed"
+      message: "DB transaction failed",
     });
-
   } finally {
     connection.release();
   }
 };
-
 
 exports.evaluateAnswers = async (req, res) => {
   const connection = await db.getConnection();
@@ -85,7 +92,7 @@ exports.evaluateAnswers = async (req, res) => {
     if (!topic_id || !answers) {
       return res.status(400).json({
         success: false,
-        message: "topic_id and answers are required"
+        message: "topic_id and answers are required",
       });
     }
 
@@ -94,7 +101,7 @@ exports.evaluateAnswers = async (req, res) => {
     // 1. Get correct answers from DB
     const [mcqs] = await connection.execute(
       "SELECT id, correct_answer, explanation, question FROM mcqs WHERE topic_id = ?",
-      [topic_id]
+      [topic_id],
     );
 
     let score = 0;
@@ -118,14 +125,14 @@ exports.evaluateAnswers = async (req, res) => {
         correct: isCorrect,
         correct_answer: q.correct_answer,
         user_answer: userAnswer,
-        explanation: q.explanation
+        explanation: q.explanation,
       };
     });
 
     // 3. Save attempt
     const [attemptResult] = await connection.execute(
       "INSERT INTO attempts (user_id, topic_id, score, total) VALUES (?, ?, ?, ?)",
-      [userId, topic_id, score, mcqs.length]
+      [userId, topic_id, score, mcqs.length],
     );
 
     const attemptId = attemptResult.insertId;
@@ -135,7 +142,7 @@ exports.evaluateAnswers = async (req, res) => {
       await connection.execute(
         `INSERT INTO answers (attempt_id, mcq_id, user_answer, is_correct)
          VALUES (?, ?, ?, ?)`,
-        [attemptId, r.mcq_id, r.user_answer, r.correct]
+        [attemptId, r.mcq_id, r.user_answer, r.correct],
       );
     }
 
@@ -146,18 +153,16 @@ exports.evaluateAnswers = async (req, res) => {
       score,
       total: mcqs.length,
       attempt_id: attemptId,
-      results
+      results,
     });
-
   } catch (error) {
     await connection.rollback();
     console.error(error);
 
     return res.status(500).json({
       success: false,
-      message: "Evaluation failed"
+      message: "Evaluation failed",
     });
-
   } finally {
     connection.release();
   }
@@ -165,20 +170,19 @@ exports.evaluateAnswers = async (req, res) => {
 
 exports.getTopicDetails = async (req, res) => {
   try {
-    const topicId = req.params.id;
+    const topicId = parseInt(req.params.id);
     const userId = req.user.id;
-
     // 1. Get main topic (only root)
     const [topics] = await db.execute(
       `SELECT * FROM topics 
-       WHERE id = ? AND parent_id IS NULL`,
-      [topicId]
+       WHERE id = ? AND created_by = ?`,
+      [topicId, userId],
     );
 
     if (!topics.length) {
       return res.status(404).json({
         success: false,
-        message: "Topic not found"
+        message: "Topic not found",
       });
     }
 
@@ -187,40 +191,34 @@ exports.getTopicDetails = async (req, res) => {
     // 2. Get subtopics (1 level only)
     const [subtopics] = await db.execute(
       `SELECT id, title FROM topics WHERE parent_id = ? AND created_by = ?`,
-      [topicId, userId]
+      [topicId, userId],
     );
 
-    const subtopicNames = subtopics.map(s => s.title);
+    const subtopicNames = subtopics.map((s) => s.title);
 
     // 3. Get MCQs
     const [mcqs] = await db.execute(
       `SELECT id, question, options, correct_answer, explanation 
        FROM mcqs WHERE topic_id = ?`,
-      [topicId]
+      [topicId],
     );
-
-    // Parse options JSON
-    const parsedMcqs = mcqs.map(q => ({
-      ...q,
-      options: JSON.parse(q.options)
-    }));
 
     // 4. Get attempts of user for this topic
     const [attempts] = await db.execute(
       `SELECT * FROM attempts 
        WHERE topic_id = ? AND user_id = ?`,
-      [topicId, userId]
+      [topicId, userId],
     );
 
     // 5. Get answers for attempts
     let answers = [];
 
     if (attempts.length) {
-      const attemptIds = attempts.map(a => a.id);
+      const attemptIds = attempts.map((a) => a.id);
 
       const [ans] = await db.query(
         `SELECT * FROM answers WHERE attempt_id IN (?)`,
-        [attemptIds]
+        [attemptIds],
       );
 
       answers = ans;
@@ -231,18 +229,17 @@ exports.getTopicDetails = async (req, res) => {
       data: {
         topic,
         subtopics: subtopicNames,
-        mcqs: parsedMcqs,
+        mcqs: mcqs,
         attempts,
-        answers
-      }
+        answers,
+      },
     });
-
   } catch (error) {
     console.error(error);
 
     return res.status(500).json({
       success: false,
-      message: "Failed to fetch topic details"
+      message: "Failed to fetch topic details",
     });
   }
 };
@@ -253,21 +250,20 @@ exports.getSubtopics = async (req, res) => {
     const userId = req.user.id;
     const [subtopics] = await db.execute(
       `SELECT id, title FROM topics WHERE parent_id = ? AND created_by = ?`,
-      [parentId, userId]
+      [parentId, userId],
     );
 
     return res.json({
       success: true,
       count: subtopics.length,
-      data: subtopics
+      data: subtopics,
     });
-
   } catch (error) {
     console.error(error);
 
     return res.status(500).json({
       success: false,
-      message: "Failed to fetch subtopics"
+      message: "Failed to fetch subtopics",
     });
   }
 };
@@ -282,17 +278,17 @@ exports.getUserHistory = async (req, res) => {
        FROM topics 
        WHERE created_by = ? AND parent_id IS NULL
        ORDER BY created_at DESC`,
-      [userId]
+      [userId],
     );
 
     if (!topics.length) {
       return res.json({
         success: true,
-        data: []
+        data: [],
       });
     }
 
-    const topicIds = topics.map(t => t.id);
+    const topicIds = topics.map((t) => t.id);
 
     // Get attempts summary
     const [attemptStats] = await db.query(
@@ -305,17 +301,17 @@ exports.getUserHistory = async (req, res) => {
       WHERE topic_id IN (?)
       GROUP BY topic_id
       `,
-      [topicIds]
+      [topicIds],
     );
 
     // Map for quick lookup
     const attemptMap = {};
-    attemptStats.forEach(a => {
+    attemptStats.forEach((a) => {
       attemptMap[a.topic_id] = a;
     });
 
     // Get latest attempt scores
-    const latestAttemptIds = attemptStats.map(a => a.latest_attempt_id);
+    const latestAttemptIds = attemptStats.map((a) => a.latest_attempt_id);
 
     let latestAttempts = [];
     if (latestAttemptIds.length) {
@@ -323,19 +319,19 @@ exports.getUserHistory = async (req, res) => {
         `SELECT id, topic_id, score, total 
          FROM attempts 
          WHERE id IN (?)`,
-        [latestAttemptIds]
+        [latestAttemptIds],
       );
 
       latestAttempts = rows;
     }
 
     const latestMap = {};
-    latestAttempts.forEach(a => {
+    latestAttempts.forEach((a) => {
       latestMap[a.topic_id] = a;
     });
 
     // Final response
-    const result = topics.map(topic => {
+    const result = topics.map((topic) => {
       const stats = attemptMap[topic.id] || {};
       const latest = latestMap[topic.id] || {};
 
@@ -345,21 +341,20 @@ exports.getUserHistory = async (req, res) => {
         created_at: topic.created_at,
         attempts_count: stats.attempts_count || 0,
         latest_score: latest.score || 0,
-        total_questions: latest.total || 0
+        total_questions: latest.total || 0,
       };
     });
 
     return res.json({
       success: true,
-      data: result
+      data: result,
     });
-
   } catch (error) {
     console.error(error);
 
     return res.status(500).json({
       success: false,
-      message: "Failed to fetch history"
+      message: "Failed to fetch history",
     });
   }
 };
